@@ -1818,6 +1818,7 @@ mod tests {
             .prepare_fork(PrepareForkParams {
                 thread_id,
                 boundary: crate::ForkBoundary::Latest,
+                source_rollout_path: None,
             })
             .await
             .expect_err("external rollouts cannot be referenced by thread id");

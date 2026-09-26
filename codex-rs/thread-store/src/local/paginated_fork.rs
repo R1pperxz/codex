@@ -1,9 +1,13 @@
 use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::ThreadHistoryMode;
+use std::path::Path;
 use std::sync::Arc;
 
 use super::LocalThreadStore;
 use super::live_writer;
 use super::model_context;
+use super::rollout_lineage::RolloutLineage;
+use super::rollout_lineage::RolloutLineageSegment;
 use super::thread_history::find_source_turn;
 use super::thread_history::find_visible_turn;
 use crate::ForkBoundary;
@@ -19,8 +23,25 @@ pub(super) async fn prepare(
     let PrepareForkParams {
         thread_id,
         boundary,
+        source_rollout_path,
     } = params;
     let source_reservation = store.live_writer_locks.reserve_lifecycle(thread_id).await;
+    if let Some(source_rollout_path) = source_rollout_path {
+        if !matches!(boundary, ForkBoundary::Latest) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "explicit rollout recovery only supports the latest boundary".to_string(),
+            });
+        }
+        let (lineage, history_base) =
+            prepare_explicit_root(store, thread_id, source_rollout_path.as_path()).await?;
+        let model_context = Arc::new(model_context::load_for_fork(lineage, Some(history_base)).await?);
+        return Ok(PreparedFork::new(
+            thread_id,
+            Some(history_base),
+            model_context,
+            source_reservation,
+        ));
+    }
     // Keep the source reserved until persistence and lineage materialization finish, even if the
     // caller cancels fork preparation.
     let lineage_store = store.clone();
@@ -82,6 +103,90 @@ pub(super) async fn prepare(
         model_context,
         source_reservation,
     ))
+}
+
+async fn prepare_explicit_root(
+    store: &LocalThreadStore,
+    thread_id: codex_protocol::ThreadId,
+    source_path: &Path,
+) -> ThreadStoreResult<(RolloutLineage, HistoryPosition)> {
+    let path = std::fs::canonicalize(source_path).map_err(|err| ThreadStoreError::InvalidRequest {
+        message: format!("cannot resolve source rollout: {err}"),
+    })?;
+    let managed = [
+        store.config.codex_home.join(codex_rollout::SESSIONS_SUBDIR),
+        store.config.codex_home.join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR),
+    ]
+    .into_iter()
+    .filter_map(|root| std::fs::canonicalize(root).ok())
+    .any(|root| path.starts_with(root));
+    if !managed || path.extension().is_none_or(|ext| ext != "jsonl") {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "source rollout must be a managed JSONL file".to_string(),
+        });
+    }
+    let meta = codex_rollout::read_session_meta_line(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::InvalidRequest {
+            message: format!("cannot read source session metadata: {err}"),
+        })?;
+    if meta.meta.id != thread_id
+        || meta.meta.history_mode != ThreadHistoryMode::Paginated
+        || meta.meta.history_base.is_some()
+    {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "source must be a paginated root belonging to the requested thread"
+                .to_string(),
+        });
+    }
+    let rollout_id = codex_rollout::rollout_id_from_path(path.as_path()).ok_or_else(|| {
+        ThreadStoreError::InvalidRequest {
+            message: "source rollout has an invalid file name".to_string(),
+        }
+    })?;
+    let bytes = tokio::fs::read(path.as_path())
+        .await
+        .map_err(|err| ThreadStoreError::InvalidRequest {
+            message: format!("cannot read source rollout: {err}"),
+        })?;
+    if !bytes.ends_with(b"\n") {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "source rollout must end at a complete JSONL record".to_string(),
+        });
+    }
+    let mut next_ordinal = 0_u64;
+    for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        let parsed = codex_rollout::parse_rollout_line_bytes(line).map_err(|err| {
+            ThreadStoreError::InvalidRequest {
+                message: format!("source rollout contains an invalid record: {err}"),
+            }
+        })?;
+        if parsed.ordinal != Some(next_ordinal) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "source rollout ordinals are not contiguous".to_string(),
+            });
+        }
+        next_ordinal += 1;
+    }
+    if next_ordinal == 0 {
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "source rollout is empty".to_string(),
+        });
+    }
+    let history_base = HistoryPosition {
+        thread_id: rollout_id,
+        end_ordinal_exclusive: next_ordinal,
+        end_byte_offset: bytes.len() as u64,
+    };
+    let lineage = RolloutLineage {
+        segments: vec![RolloutLineageSegment {
+            rollout_id,
+            rollout_path: path,
+            start_ordinal: 1,
+            end: None,
+        }],
+    };
+    Ok((lineage, history_base))
 }
 
 pub(super) async fn history_base_at_boundary(

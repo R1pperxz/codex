@@ -8,6 +8,8 @@ use codex_history::RolloutItem;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::HistoryPosition;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_state::ThreadStateAuditRow;
 use codex_utils_path::normalize_for_path_comparison;
 use std::collections::BTreeMap;
@@ -24,12 +26,19 @@ const SUMMARY_LIMIT: usize = 8;
 const CHECK_ID: &str = "state.rollout_db_parity";
 const CHECK_CATEGORY: &str = "threads";
 
+#[path = "rollout_lineage_audit.rs"]
+mod rollout_lineage_audit;
+
 #[derive(Clone, Debug)]
 struct RolloutAuditFile {
     path: PathBuf,
     key: PathBuf,
     archived: bool,
     thread_id: String,
+    rollout_id: String,
+    history_base: Option<HistoryPosition>,
+    first_ordinal: Option<u64>,
+    paginated: bool,
 }
 
 #[derive(Default)]
@@ -42,9 +51,16 @@ struct RolloutScan {
 }
 
 enum RolloutThreadId {
-    Id(String),
+    Id(RolloutHeader),
     MalformedName,
     Unusable(String),
+}
+
+struct RolloutHeader {
+    thread_id: String,
+    history_base: Option<HistoryPosition>,
+    first_ordinal: Option<u64>,
+    paginated: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -236,8 +252,9 @@ fn parity_check_from_scan_and_rows(
             .push(row);
     }
 
-    let missing_active = missing_rollout_paths(&scan.files, &rows_by_key, /*archived*/ false);
-    let missing_archived = missing_rollout_paths(&scan.files, &rows_by_key, /*archived*/ true);
+    let lineage = rollout_lineage_audit::audit(&scan.files, &rows_by_key);
+    let missing_active = missing_rollout_paths(&scan.files, &lineage.owned_keys, /*archived*/ false);
+    let missing_archived = missing_rollout_paths(&scan.files, &lineage.owned_keys, /*archived*/ true);
     let scan_complete = !scan.reached_scan_cap;
     let stale_rows = if scan_complete {
         rows.iter()
@@ -271,7 +288,8 @@ fn parity_check_from_scan_and_rows(
     } else {
         Vec::new()
     };
-    let duplicate_rollout_thread_ids = duplicate_rollout_thread_ids(&scan.files);
+    let duplicate_rollout_thread_ids =
+        duplicate_rollout_thread_ids(&scan.files, &lineage.owned_keys);
     let duplicate_db_paths = duplicate_db_paths(&rows_by_key);
     let archived_rows = rows.iter().filter(|row| row.archived).count();
     let active_rows = rows.len() - archived_rows;
@@ -301,6 +319,11 @@ fn parity_check_from_scan_and_rows(
             "rollout DB duplicate DB paths: {}",
             duplicate_db_paths.len()
         ),
+        format!(
+            "rollout DB retained paginated segments: {}",
+            lineage.retained_segments
+        ),
+        format!("rollout DB lineage errors: {}", lineage.errors.len()),
         format!(
             "rollout DB model providers: {}",
             count_summary(rows.iter().map(|row| row.model_provider.as_str()))
@@ -342,6 +365,11 @@ fn parity_check_from_scan_and_rows(
         "rollout DB duplicate DB path sample",
         duplicate_db_paths.iter().map(PathBuf::as_path),
     );
+    push_samples(
+        &mut details,
+        "rollout DB lineage error sample",
+        lineage.errors.iter().map(String::as_str),
+    );
 
     let status = if scan.scan_errors.is_empty()
         && scan.malformed_names.is_empty()
@@ -352,6 +380,7 @@ fn parity_check_from_scan_and_rows(
         && archive_mismatches.is_empty()
         && duplicate_rollout_thread_ids.is_empty()
         && duplicate_db_paths.is_empty()
+        && lineage.errors.is_empty()
     {
         CheckStatus::Ok
     } else {
@@ -414,6 +443,13 @@ fn parity_check_from_scan_and_rows(
             ))
             .expected("one rollout path and thread id per thread")
             .remedy("Attach the doctor report to a bug report so support can inspect samples."),
+        );
+    }
+    if !lineage.errors.is_empty() {
+        check = check.issue(
+            DoctorIssue::new(CheckStatus::Warning, "paginated history lineage is invalid")
+                .measured(format!("{} lineage errors", lineage.errors.len()))
+                .expected("every referenced ancestor has a valid cutoff boundary"),
         );
     }
     if !scan.scan_errors.is_empty() || !scan.malformed_names.is_empty() || scan.reached_scan_cap {
@@ -502,8 +538,8 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
             }
             let key = path_key(&logical_path);
             scan.existing_keys.insert(key.clone());
-            let thread_id = match thread_id_from_rollout(&path).await {
-                RolloutThreadId::Id(thread_id) => thread_id,
+            let header = match thread_id_from_rollout(&path).await {
+                RolloutThreadId::Id(header) => header,
                 RolloutThreadId::MalformedName => {
                     scan.record_malformed_name(path.clone());
                     continue;
@@ -513,11 +549,19 @@ async fn scan_rollout_root(root: &Path, archived: bool, scan: &mut RolloutScan) 
                     continue;
                 }
             };
+            let Some(rollout_id) = codex_rollout::rollout_id_from_path(&logical_path) else {
+                scan.record_malformed_name(path);
+                continue;
+            };
             scan.files.push(RolloutAuditFile {
                 key,
                 path,
                 archived,
-                thread_id,
+                thread_id: header.thread_id,
+                rollout_id: rollout_id.to_string(),
+                history_base: header.history_base,
+                first_ordinal: header.first_ordinal,
+                paginated: header.paginated,
             });
         }
     }
@@ -544,9 +588,12 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
         if item_type == "session_meta" {
             return match codex_rollout::parse_rollout_line(line.trim()) {
                 Ok(line) => match line.item {
-                    RolloutItem::SessionMeta(session_meta) => {
-                        RolloutThreadId::Id(session_meta.meta.id.to_string())
-                    }
+                    RolloutItem::SessionMeta(session_meta) => RolloutThreadId::Id(RolloutHeader {
+                        thread_id: session_meta.meta.id.to_string(),
+                        history_base: session_meta.meta.history_base,
+                        first_ordinal: line.ordinal,
+                        paginated: session_meta.meta.history_mode == ThreadHistoryMode::Paginated,
+                    }),
                     _ => RolloutThreadId::Unusable(format!(
                         "rollout at {} has invalid session metadata",
                         path.display()
@@ -573,7 +620,14 @@ async fn thread_id_from_rollout(path: &Path) -> RolloutThreadId {
     // the bounded prefix without retaining the first item or loading the full history.
     let logical_path = codex_rollout::plain_rollout_path(path);
     codex_rollout::builder_from_items(&[], &logical_path)
-        .map(|builder| RolloutThreadId::Id(builder.id.to_string()))
+        .map(|builder| {
+            RolloutThreadId::Id(RolloutHeader {
+                thread_id: builder.id.to_string(),
+                history_base: None,
+                first_ordinal: None,
+                paginated: false,
+            })
+        })
         .unwrap_or(RolloutThreadId::MalformedName)
 }
 
@@ -614,12 +668,12 @@ fn archived_from_rollout_path(codex_home: &Path, path: &Path) -> Option<bool> {
 
 fn missing_rollout_paths<'a>(
     files: &'a [RolloutAuditFile],
-    rows_by_key: &HashMap<PathBuf, Vec<&ThreadStateAuditRow>>,
+    owned_keys: &HashSet<PathBuf>,
     archived: bool,
 ) -> Vec<&'a Path> {
     files
         .iter()
-        .filter(|file| file.archived == archived && !has_matching_thread_row(file, rows_by_key))
+        .filter(|file| file.archived == archived && !owned_keys.contains(&file.key))
         .map(|file| file.path.as_path())
         .collect()
 }
@@ -634,15 +688,20 @@ fn has_matching_thread_row(
     rows.iter().any(|row| row.id == file.thread_id.as_str())
 }
 
-fn duplicate_rollout_thread_ids(files: &[RolloutAuditFile]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut duplicates = HashSet::new();
-    for thread_id in files.iter().map(|file| file.thread_id.as_str()) {
-        if !seen.insert(thread_id) {
-            duplicates.insert(thread_id.to_string());
-        }
+fn duplicate_rollout_thread_ids(
+    files: &[RolloutAuditFile],
+    owned_keys: &HashSet<PathBuf>,
+) -> Vec<String> {
+    let mut counts = HashMap::new();
+    for file in files {
+        let entry = counts.entry(file.thread_id.as_str()).or_insert((0, false));
+        entry.0 += 1;
+        entry.1 |= !owned_keys.contains(&file.key);
     }
-    let mut duplicates = duplicates.into_iter().collect::<Vec<_>>();
+    let mut duplicates = counts
+        .into_iter()
+        .filter_map(|(id, (count, unowned))| (count > 1 && unowned).then(|| id.to_string()))
+        .collect::<Vec<_>>();
     duplicates.sort();
     duplicates
 }
@@ -791,6 +850,61 @@ mod tests {
         assert_detail(&check, "rollout DB missing archived rows", "0");
         assert_detail(&check, "rollout DB stale rows", "0");
         assert_detail(&check, "rollout DB archive mismatches", "0");
+    }
+
+    #[tokio::test]
+    async fn thread_inventory_accepts_retained_paginated_root() {
+        let fixture = Fixture::new().await;
+        let thread_id = "00000000-0000-0000-0000-000000000001";
+        let root = fixture.write_rollout(false, "2025-01-02T10-00-00", thread_id);
+        let continuation = fixture
+            .codex_home
+            .path()
+            .join("sessions/2025/01/02/rollout-2025-01-02T11-00-00-00000000-0000-0000-0000-000000000001_00000000-0000-0000-0000-000000000002.jsonl");
+        let mut root_line = codex_rollout::parse_rollout_line(
+            std::fs::read_to_string(&root).expect("root").trim(),
+        )
+        .expect("root line");
+        root_line.ordinal = Some(0);
+        let RolloutItem::SessionMeta(root_meta) = &mut root_line.item else {
+            panic!("expected session metadata");
+        };
+        root_meta.meta.history_mode = ThreadHistoryMode::Paginated;
+        let root_bytes = format!("{}\n", serde_json::to_string(&root_line).expect("root JSON"));
+        std::fs::write(&root, &root_bytes).expect("root file");
+
+        let mut continuation_line = root_line;
+        continuation_line.ordinal = Some(1);
+        let RolloutItem::SessionMeta(continuation_meta) = &mut continuation_line.item else {
+            panic!("expected session metadata");
+        };
+        continuation_meta.meta.history_base = Some(HistoryPosition {
+            thread_id: ThreadId::from_string(thread_id).expect("root rollout ID"),
+            end_ordinal_exclusive: 1,
+            end_byte_offset: root_bytes.len() as u64,
+        });
+        std::fs::write(
+            &continuation,
+            format!(
+                "{}\n",
+                serde_json::to_string(&continuation_line).expect("continuation JSON")
+            ),
+        )
+        .expect("continuation file");
+        fixture
+            .insert_thread_row(thread_id, &continuation, false)
+            .await;
+
+        let check = thread_inventory_check_for_roots(
+            fixture.codex_home.path(),
+            &fixture.sqlite(),
+            "test-provider",
+        )
+        .await;
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_detail(&check, "rollout DB retained paginated segments", "1");
+        assert_detail(&check, "rollout DB missing active rows", "0");
+        assert_detail(&check, "rollout DB duplicate rollout thread ids", "0");
     }
 
     #[tokio::test]
@@ -1096,7 +1210,7 @@ mod tests {
 
         assert!(matches!(
             thread_id_from_rollout(&valid_path).await,
-            RolloutThreadId::Id(id) if id == thread_id
+            RolloutThreadId::Id(header) if header.thread_id == thread_id
         ));
         assert!(matches!(
             thread_id_from_rollout(&malformed_path).await,
@@ -1134,7 +1248,7 @@ mod tests {
 
         assert!(matches!(
             thread_id_from_rollout(&path).await,
-            RolloutThreadId::Id(id) if id == metadata_id.to_string()
+            RolloutThreadId::Id(header) if header.thread_id == metadata_id.to_string()
         ));
     }
 
@@ -1175,7 +1289,7 @@ mod tests {
 
         assert!(matches!(
             thread_id_from_rollout(&path).await,
-            RolloutThreadId::Id(id) if id == metadata_id.to_string()
+            RolloutThreadId::Id(header) if header.thread_id == metadata_id.to_string()
         ));
     }
 
@@ -1201,7 +1315,7 @@ mod tests {
 
         assert!(matches!(
             thread_id_from_rollout(&path).await,
-            RolloutThreadId::Id(id) if id == thread_id
+            RolloutThreadId::Id(header) if header.thread_id == thread_id
         ));
     }
 

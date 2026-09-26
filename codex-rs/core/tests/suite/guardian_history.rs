@@ -119,6 +119,7 @@ async fn guardian_history_survives_restart_and_user_fork(
             .prepare_fork(PrepareForkParams {
                 thread_id,
                 boundary: ForkBoundary::Latest,
+                source_rollout_path: None,
             })
             .await?;
         initial

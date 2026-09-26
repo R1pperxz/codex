@@ -4897,6 +4897,7 @@ impl ThreadRequestProcessor {
                     .prepare_fork(codex_thread_store::PrepareForkParams {
                         thread_id: source_thread_id,
                         boundary,
+                        source_rollout_path: path.clone().map(PathBuf::from),
                     })
                     .await
                     .map_err(|err| match err {

@@ -802,6 +802,7 @@ async fn named_fork_boundaries_reject_invisible_and_noncanonical_turns() {
         .prepare_fork(PrepareForkParams {
             thread_id: child_id,
             boundary: ForkBoundary::ThroughTurn("inherited-turn".to_string()),
+            source_rollout_path: None,
         })
         .await
         .expect_err("cannot fork through an inherited active turn");
@@ -855,6 +856,7 @@ async fn named_fork_boundaries_reject_invisible_and_noncanonical_turns() {
             .prepare_fork(PrepareForkParams {
                 thread_id,
                 boundary,
+                source_rollout_path: None,
             })
             .await
             .expect_err("reject an invalid fork boundary");
@@ -1107,6 +1109,7 @@ async fn paginated_fork_reads_compressed_shared_lineage_without_materializing() 
         .prepare_fork(PrepareForkParams {
             thread_id: source_thread_id,
             boundary: ForkBoundary::Latest,
+            source_rollout_path: None,
         })
         .await
         .expect_err("external shared source cannot be referenced by rollout id");
@@ -1171,6 +1174,7 @@ async fn cancelled_fork_keeps_source_reserved_until_lineage_resolution_finishes(
             .prepare_fork(PrepareForkParams {
                 thread_id: source_thread_id,
                 boundary: ForkBoundary::Latest,
+                source_rollout_path: None,
             })
             .await
     });
@@ -1226,6 +1230,7 @@ async fn prepared_fork_reserves_source_until_child_reference_is_durable() {
         .prepare_fork(PrepareForkParams {
             thread_id: source_thread_id,
             boundary: ForkBoundary::Latest,
+            source_rollout_path: None,
         })
         .await
         .expect("prepare referenced fork");
@@ -2611,6 +2616,7 @@ async fn prepare_paginated_fork(
         .prepare_fork(PrepareForkParams {
             thread_id,
             boundary,
+            source_rollout_path: None,
         })
         .await
         .expect("prepare paginated fork")

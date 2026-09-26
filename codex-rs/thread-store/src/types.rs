@@ -208,6 +208,8 @@ pub struct PrepareForkParams {
     pub thread_id: ThreadId,
     /// Requested inclusive or exclusive fork boundary.
     pub boundary: ForkBoundary,
+    /// Explicit immutable root rollout to recover as a separate fork.
+    pub source_rollout_path: Option<PathBuf>,
 }
 
 /// Parameters for reverting a paginated thread's durable history.

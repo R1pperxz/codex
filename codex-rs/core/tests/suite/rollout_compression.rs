@@ -83,6 +83,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         .prepare_fork(PrepareForkParams {
             thread_id: test.session_configured.thread_id,
             boundary: ForkBoundary::Latest,
+            source_rollout_path: None,
         })
         .await?;
     let child = test

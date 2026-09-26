@@ -1048,6 +1048,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 request_id: request_ids.next(),
                 params: ThreadForkParams {
                     thread_id: source_thread_id,
+                    path: args.rollout_path.clone(),
                     model: config.model.clone(),
                     model_provider: Some(config.model_provider_id.clone()),
                     cwd: Some(config.cwd.to_string_lossy().to_string()),
@@ -1059,7 +1060,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     config: thread_config_overrides_from_config(&config),
                     ephemeral: config.ephemeral,
                     thread_source: Some(thread_source.clone()),
-                    exclude_turns: true,
+                    exclude_turns: args.rollout_path.is_none(),
                     defer_goal_continuation: !config.ephemeral,
                     ..ThreadForkParams::default()
                 },

@@ -867,6 +867,7 @@ async fn standalone_fork_retains_inherited_user_instructions(
             .prepare_fork(PrepareForkParams {
                 thread_id: worker.startup_metadata().thread_id,
                 boundary: ForkBoundary::Latest,
+                source_rollout_path: None,
             })
             .await?;
         test.thread_manager

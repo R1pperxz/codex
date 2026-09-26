@@ -164,6 +164,10 @@ pub struct ForkArgs {
     #[arg(value_name = "SESSION_ID")]
     pub session_id: String,
 
+    /// Recover an immutable paginated root rollout as a separate fork.
+    #[arg(long = "rollout-path", value_name = "FILE")]
+    pub rollout_path: Option<PathBuf>,
+
     /// Optional image(s) to attach to the prompt sent after forking.
     #[arg(
         long = "image",

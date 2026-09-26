@@ -1590,6 +1590,7 @@ async fn fork_preserves_thread_instructions(
                 .prepare_fork(PrepareForkParams {
                     thread_id: parent_id,
                     boundary: ForkBoundary::Latest,
+                    source_rollout_path: None,
                 })
                 .await?;
             test.thread_manager
