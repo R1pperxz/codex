@@ -1,0 +1,31 @@
+name: Session index repair Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt
+      - name: Format changed Rust sources for the build
+        run: cargo fmt -- --config imports_granularity=Item
+      - name: Test thread inventory
+        run: cargo test -p codex-cli thread_inventory --lib
+      - name: Build Codex CLI
+        run: cargo build -p codex-cli --release --bin codex
+      - name: Upload Windows CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-session-index-repair-windows
+          path: codex-rs/target/release/codex.exe
+          if-no-files-found: error
