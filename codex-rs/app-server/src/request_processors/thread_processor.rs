@@ -4846,13 +4846,27 @@ impl ThreadRequestProcessor {
                 "`permissions` cannot be combined with `sandbox`",
             ));
         }
-        let source_thread = self
-            .read_stored_thread_for_resume(
+        let current_thread = self
+            .read_stored_thread_for_resume(&thread_id, None, /*include_history*/ false)
+            .await;
+        let recovering_explicit_root = current_thread.as_ref().ok().is_some_and(|current_thread| {
+            path.as_ref().is_some_and(|requested_path| {
+                matches!(current_thread.history_mode, ThreadHistoryMode::Paginated)
+                    && current_thread.rollout_path.as_ref().is_some_and(|current_path| {
+                        !path_utils::paths_match_after_normalization(requested_path, current_path)
+                    })
+            })
+        });
+        let source_thread = if recovering_explicit_root || path.is_none() {
+            current_thread?
+        } else {
+            self.read_stored_thread_for_resume(
                 &thread_id,
                 path.as_ref(),
                 /*include_history*/ false,
             )
-            .await?;
+            .await?
+        };
         let paginated_source = matches!(source_thread.history_mode, ThreadHistoryMode::Paginated);
         if last_turn_id.is_some() && before_turn_id.is_some() {
             return Err(invalid_request(
@@ -4897,7 +4911,7 @@ impl ThreadRequestProcessor {
                     .prepare_fork(codex_thread_store::PrepareForkParams {
                         thread_id: source_thread_id,
                         boundary,
-                        source_rollout_path: path.clone().map(PathBuf::from),
+                        source_rollout_path: recovering_explicit_root.then(|| path.clone()).flatten(),
                     })
                     .await
                     .map_err(|err| match err {
